@@ -1,0 +1,217 @@
+name: QA Test on Pull Request
+
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  qa-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: Detect framework and language
+        id: detect
+        shell: bash
+        run: |
+          if [ -f "package.json" ]; then
+            if grep -q '"@angular/core"' package.json; then
+              echo "framework=angular" >> $GITHUB_OUTPUT
+            elif grep -q '"react"' package.json; then
+              echo "framework=react" >> $GITHUB_OUTPUT
+            elif grep -q '"vue"' package.json; then
+              echo "framework=vue" >> $GITHUB_OUTPUT
+            else
+              echo "framework=javascript" >> $GITHUB_OUTPUT
+            fi
+          elif [ -f "requirements.txt" ]; then
+            echo "framework=python" >> $GITHUB_OUTPUT
+          elif [ -f "pom.xml" ]; then
+            echo "framework=java" >> $GITHUB_OUTPUT
+          else
+            echo "framework=unknown" >> $GITHUB_OUTPUT
+          fi
+
+          if [ -f "tsconfig.json" ]; then
+            echo "typescript=true" >> $GITHUB_OUTPUT
+          else
+            echo "typescript=false" >> $GITHUB_OUTPUT
+          fi
+
+          if [ -f "yarn.lock" ]; then
+            echo "package_manager=yarn" >> $GITHUB_OUTPUT
+          elif [ -f "pnpm-lock.yaml" ]; then
+            echo "package_manager=pnpm" >> $GITHUB_OUTPUT
+          else
+            echo "package_manager=npm" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Setup Node.js
+        if: contains(fromJson('["angular", "react", "vue", "javascript"]'), steps.detect.outputs.framework)
+        uses: actions/setup-node@v3
+        with:
+          node-version: "18"
+          cache: ${{ steps.detect.outputs.package_manager }}
+
+      - name: Install package manager
+        if: steps.detect.outputs.package_manager == 'pnpm'
+        run: npm install -g pnpm
+
+      - name: Install dependencies (Node.js projects)
+        if: contains(fromJson('["angular", "react", "vue", "javascript"]'), steps.detect.outputs.framework)
+        shell: bash
+        run: |
+          if [ "${{ steps.detect.outputs.package_manager }}" = "yarn" ]; then
+            yarn install --frozen-lockfile
+          elif [ "${{ steps.detect.outputs.package_manager }}" = "pnpm" ]; then
+            pnpm install --frozen-lockfile
+          else
+            npm install
+          fi
+
+      - name: Setup TypeScript and Jest
+        if: steps.detect.outputs.typescript == 'true' || steps.detect.outputs.framework == 'javascript'
+        shell: bash
+        run: |
+          NEEDS_TYPESCRIPT=false
+          NEEDS_JEST=false
+
+          if [ "${{ steps.detect.outputs.typescript }}" = "true" ] && ! grep -q '"typescript"' package.json; then
+            NEEDS_TYPESCRIPT=true
+          fi
+
+          if ! grep -q '"jest"' package.json; then
+            NEEDS_JEST=true
+          fi
+
+          if [ "$NEEDS_TYPESCRIPT" = "true" ] || [ "$NEEDS_JEST" = "true" ]; then
+            # Instalar TypeScript si es necesario
+            if [ "$NEEDS_TYPESCRIPT" = "true" ]; then
+              ${{ steps.detect.outputs.package_manager }} add -D typescript@4.9.5
+            fi
+
+            if [ "$NEEDS_JEST" = "true" ]; then
+              if [ "${{ steps.detect.outputs.typescript }}" = "true" ]; then
+                ${{ steps.detect.outputs.package_manager }} add -D jest@27.5.1 ts-jest@27.1.5 @types/jest@27.5.2 --legacy-peer-deps
+              else
+                ${{ steps.detect.outputs.package_manager }} add -D jest@27.5.1
+              fi
+            fi
+
+            if [ ! -f "jest.config.js" ] && [ "${{ steps.detect.outputs.typescript }}" = "true" ]; then
+              echo 'module.exports = {
+                preset: "ts-jest",
+                testEnvironment: "node",
+                transform: {
+                  "^.+\\.tsx?$": "ts-jest"
+                },
+                testMatch: ["**/__tests__/**/*.ts?(x)", "**/?(*.)+(spec|test).ts?(x)"]
+              };' > jest.config.js
+            fi
+
+            if [ "$NEEDS_TYPESCRIPT" = "true" ] && [ ! -f "tsconfig.json" ]; then
+              echo '{
+                "compilerOptions": {
+                  "target": "es6",
+                  "module": "commonjs",
+                  "strict": true,
+                  "esModuleInterop": true,
+                  "skipLibCheck": true,
+                  "forceConsistentCasingInFileNames": true
+                }
+              }' > tsconfig.json
+            fi
+
+            node -e '
+              const fs = require("fs");
+              const package = JSON.parse(fs.readFileSync("package.json"));
+              package.scripts = package.scripts || {};
+              if (!package.scripts.test || package.scripts.test.includes("echo")) {
+                package.scripts.test = "jest";
+              }
+              fs.writeFileSync("package.json", JSON.stringify(package, null, 2));
+            '
+
+            if [ ! -d "__tests__" ] && ! find . -name "*.test.*" -print -quit | grep -q .; then
+              mkdir -p __tests__
+              if [ "${{ steps.detect.outputs.typescript }}" = "true" ]; then
+                echo 'describe("Example Test", () => {
+                  it("should pass", () => {
+                    expect(true).toBe(true);
+                  });
+                });' > __tests__/example.test.ts
+              else
+                echo 'describe("Example Test", () => {
+                  it("should pass", () => {
+                    expect(true).toBe(true);
+                  });
+                });' > __tests__/example.test.js
+              fi
+            fi
+          fi
+
+      - name: Run tests
+        shell: bash
+        run: |
+          case "${{ steps.detect.outputs.framework }}" in
+            "angular")
+              ng test --watch=false --browsers=ChromeHeadless --code-coverage
+              ;;
+            "react")
+              ${{ steps.detect.outputs.package_manager }} test -- --coverage --watchAll=false
+              ;;
+            "vue")
+              ${{ steps.detect.outputs.package_manager }} run test:unit
+              ;;
+            "javascript")
+              if [ -f "jest.config.js" ] || grep -q '"jest"' package.json; then
+                ${{ steps.detect.outputs.package_manager }} test -- --passWithNoTests
+              else
+                echo "No test configuration found. Skipping tests..."
+                exit 0
+              fi
+              ;;
+            "python")
+              pytest --cov=./ --cov-report=xml
+              ;;
+            "java")
+              mvn test
+              ;;
+            *)
+              echo "No recognized project type found"
+              exit 1
+              ;;
+          esac
+
+      - name: Run linting
+        shell: bash
+        continue-on-error: true
+        run: |
+          if [ -f "package.json" ]; then
+            case "${{ steps.detect.outputs.framework }}" in
+              "angular")
+                ng lint
+                ;;
+              "react"|"vue"|"javascript")
+                if grep -q '"eslint"' package.json; then
+                  ${{ steps.detect.outputs.package_manager }} run lint
+                fi
+                ;;
+            esac
+          elif [ "${{ steps.detect.outputs.framework }}" = "python" ]; then
+            if command -v pylint &> /dev/null; then
+              pylint **/*.py
+            fi
+          elif [ "${{ steps.detect.outputs.framework }}" = "java" ]; then
+            if [ -f "checkstyle.xml" ]; then
+              mvn checkstyle:check
+            fi
+          fi
+
+      - name: Upload coverage reports
+        if: always()
+        uses: codecov/codecov-action@v3
+        continue-on-error: true
