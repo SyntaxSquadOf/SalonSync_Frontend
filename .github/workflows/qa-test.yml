@@ -27,6 +27,13 @@ jobs:
             else
               echo "framework=javascript" >> $GITHUB_OUTPUT
             fi
+            
+            # Detect if project uses ES modules
+            if grep -q '"type":\s*"module"' package.json; then
+              echo "module_type=esm" >> $GITHUB_OUTPUT
+            else
+              echo "module_type=commonjs" >> $GITHUB_OUTPUT
+            fi
           elif [ -f "requirements.txt" ]; then
             echo "framework=python" >> $GITHUB_OUTPUT
           elif [ -f "pom.xml" ]; then
@@ -88,20 +95,34 @@ jobs:
           fi
 
           if [ "$NEEDS_TYPESCRIPT" = "true" ] || [ "$NEEDS_JEST" = "true" ]; then
-            # Instalar TypeScript si es necesario
             if [ "$NEEDS_TYPESCRIPT" = "true" ]; then
               ${{ steps.detect.outputs.package_manager }} add -D typescript@4.9.5
             fi
 
             if [ "$NEEDS_JEST" = "true" ]; then
               if [ "${{ steps.detect.outputs.typescript }}" = "true" ]; then
-                ${{ steps.detect.outputs.package_manager }} add -D jest@27.5.1 ts-jest@27.1.5 @types/jest@27.5.2 --legacy-peer-deps
+                ${{ steps.detect.outputs.package_manager }} add -D jest@29.7.0 ts-jest@29.1.1 @types/jest@29.5.0 --legacy-peer-deps
               else
-                ${{ steps.detect.outputs.package_manager }} add -D jest@27.5.1
+                ${{ steps.detect.outputs.package_manager }} add -D jest@29.7.0
               fi
             fi
 
-            if [ ! -f "jest.config.js" ] && [ "${{ steps.detect.outputs.typescript }}" = "true" ]; then
+            # Create jest config based on module type
+            if [ "${{ steps.detect.outputs.module_type }}" = "esm" ]; then
+              echo 'export default {
+                transform: {
+                  "^.+\\.tsx?$": ["ts-jest", {
+                    useESM: true
+                  }]
+                },
+                extensionsToTreatAsEsm: [".ts", ".tsx"],
+                moduleNameMapper: {
+                  "^(\\.{1,2}/.*)\\.js$": "$1"
+                },
+                testEnvironment: "node",
+                testMatch: ["**/__tests__/**/*.ts?(x)", "**/?(*.)+(spec|test).ts?(x)"]
+              };' > jest.config.mjs
+            else
               echo 'module.exports = {
                 preset: "ts-jest",
                 testEnvironment: "node",
@@ -116,7 +137,8 @@ jobs:
               echo '{
                 "compilerOptions": {
                   "target": "es6",
-                  "module": "commonjs",
+                  "module": "esnext",
+                  "moduleResolution": "node",
                   "strict": true,
                   "esModuleInterop": true,
                   "skipLibCheck": true,
@@ -125,12 +147,13 @@ jobs:
               }' > tsconfig.json
             fi
 
+            # Update package.json test script
             node -e '
               const fs = require("fs");
               const package = JSON.parse(fs.readFileSync("package.json"));
               package.scripts = package.scripts || {};
               if (!package.scripts.test || package.scripts.test.includes("echo")) {
-                package.scripts.test = "jest";
+                package.scripts.test = "node --experimental-vm-modules node_modules/jest/bin/jest.js";
               }
               fs.writeFileSync("package.json", JSON.stringify(package, null, 2));
             '
@@ -161,14 +184,22 @@ jobs:
               ng test --watch=false --browsers=ChromeHeadless --code-coverage
               ;;
             "react")
-              ${{ steps.detect.outputs.package_manager }} test -- --coverage --watchAll=false
+              if [ "${{ steps.detect.outputs.module_type }}" = "esm" ]; then
+                node --experimental-vm-modules node_modules/jest/bin/jest.js --coverage --watchAll=false
+              else
+                ${{ steps.detect.outputs.package_manager }} test -- --coverage --watchAll=false
+              fi
               ;;
             "vue")
               ${{ steps.detect.outputs.package_manager }} run test:unit
               ;;
             "javascript")
-              if [ -f "jest.config.js" ] || grep -q '"jest"' package.json; then
-                ${{ steps.detect.outputs.package_manager }} test -- --passWithNoTests
+              if [ -f "jest.config.js" ] || [ -f "jest.config.mjs" ] || grep -q '"jest"' package.json; then
+                if [ "${{ steps.detect.outputs.module_type }}" = "esm" ]; then
+                  node --experimental-vm-modules node_modules/jest/bin/jest.js --passWithNoTests
+                else
+                  ${{ steps.detect.outputs.package_manager }} test -- --passWithNoTests
+                fi
               else
                 echo "No test configuration found. Skipping tests..."
                 exit 0
